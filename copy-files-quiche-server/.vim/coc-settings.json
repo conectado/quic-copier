@@ -1,0 +1,7 @@
+{
+    "rust-analyzer.checkOnSave.extraArgs": [
+        "--target-dir",
+        "~/Repos/joystream/target/check"
+    ],
+    "rust-analyzer.checkOnSave.enable": true
+}
