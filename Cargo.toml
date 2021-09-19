@@ -1,0 +1,6 @@
+[workspace]
+members = [
+  "connection-manager",
+  "client",
+  "server",
+]
