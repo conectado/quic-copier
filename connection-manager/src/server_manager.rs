@@ -2,7 +2,7 @@ use crate::config::*;
 use anyhow::Result;
 use futures::future::OptionFuture;
 use log::{debug, error, info, trace, warn};
-use quiche::{Config, Connection};
+use quiche::{Config, Connection, ConnectionId, Header};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -64,6 +64,176 @@ impl ConnectionManager {
     }
 }
 
+async fn version_negotiation(
+    scid: &ConnectionId<'_>,
+    dcid: &ConnectionId<'_>,
+    src: &std::net::SocketAddr,
+    sock: &UdpSocket,
+) {
+    let mut out = [0; MAX_DATAGRAM_SIZE];
+    warn!("Doing version negotiation");
+
+    let len = quiche::negotiate_version(scid, dcid, &mut out).unwrap();
+
+    let out = &out[..len];
+
+    if let Err(err) = sock.send_to(out, &src).await {
+        error!("Could not send packet: {}", err);
+    }
+}
+
+async fn stateless_retry(
+    hdr: &Header<'_>,
+    src: &SocketAddr,
+    scid: &ConnectionId<'_>,
+    sock: &UdpSocket,
+) {
+    let mut out = [0; MAX_DATAGRAM_SIZE];
+
+    warn!("Doing stateless retry");
+
+    let new_token = mint_token(&hdr, &src);
+
+    let len = quiche::retry(
+        &hdr.scid,
+        &hdr.dcid,
+        &scid,
+        &new_token,
+        hdr.version,
+        &mut out,
+    )
+    .unwrap();
+
+    let out = &out[..len];
+
+    if let Err(e) = sock.send_to(out, &src).await {
+        error!("send() failed: {:?}", e);
+    }
+}
+
+async fn get_client<'a>(
+    clients: &'a mut ClientMap,
+    hdr: &'a Header<'static>,
+    conn_id: &'a ConnectionId<'static>,
+    src: &SocketAddr,
+    sock: &'a UdpSocket,
+    mut config: &'a mut Config,
+) -> Option<&'a mut (SocketAddr, Client)> {
+    if !clients.contains_key(&hdr.dcid) && !clients.contains_key(conn_id) {
+        if hdr.ty != quiche::Type::Initial {
+            error!("Packet is not Initial");
+            return None;
+            //continue;
+        }
+
+        if !quiche::version_is_supported(hdr.version) {
+            version_negotiation(&hdr.scid, &hdr.dcid, &src, &sock).await;
+            return None;
+            //continue;
+        }
+
+        let mut scid = [0; quiche::MAX_CONN_ID_LEN];
+        scid.copy_from_slice(&conn_id);
+
+        let scid = quiche::ConnectionId::from_ref(&scid);
+
+        // Token is always present in Initial packets.
+        let token = hdr.token.as_ref().unwrap();
+
+        // Do stateless retry if the client didn't send a token.
+        if token.is_empty() {
+            stateless_retry(&hdr, &src, &scid, &sock).await;
+            return None;
+            //continue;
+        }
+
+        let odcid = validate_token(&src, token);
+
+        // The token was not valid, meaning the retry failed, so
+        // drop the packet.
+        if odcid.is_none() {
+            error!("Invalid address validation token");
+            return None;
+            //continue;
+        }
+
+        if scid.len() != hdr.dcid.len() {
+            error!("Invalid destination connection ID");
+            return None;
+            //continue;
+        }
+
+        // Reuse the source connection ID we sent in the Retry packet,
+        // instead of changing it again.
+        let scid = hdr.dcid.clone();
+
+        debug!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
+
+        let conn = quiche::accept(&scid, odcid.as_ref(), &mut config).unwrap();
+
+        let client = Client {
+            conn,
+            partial_responses: HashMap::new(),
+        };
+
+        clients.insert(scid.clone(), (*src, client));
+
+        let scid = &scid;
+        clients.get_mut(scid)
+    } else {
+        // To appease the borrow checker god
+        if clients.contains_key(&hdr.dcid) {
+            clients.get_mut(&hdr.dcid)
+        } else {
+            clients.get_mut(&conn_id)
+        }
+    }
+}
+
+macro_rules! skip_none {
+    ($res:expr) => {
+        match $res {
+            Some(val) => val,
+            None => {
+                continue;
+            }
+        }
+    };
+}
+
+async fn handle_ready_client(client: &mut Client) {
+    let mut buf = [0; MAX_DATAGRAM_SIZE];
+    // Handle writable streams.
+    for stream_id in client.conn.writable() {
+        handle_writable(client, stream_id);
+    }
+
+    // Process all readable streams.
+    for s in client.conn.readable() {
+        while let Ok((read, fin)) = client.conn.stream_recv(s, &mut buf) {
+            debug!("{} received {} bytes", client.conn.trace_id(), read);
+
+            let stream_buf = &buf[..read];
+
+            debug!(
+                "{} stream {} has {} bytes (fin? {})",
+                client.conn.trace_id(),
+                s,
+                stream_buf.len(),
+                fin
+            );
+
+            handle_stream(client, s, stream_buf, "index.html").await;
+        }
+    }
+}
+
+fn get_conn_id(conn_id_seed: &Key, dest_conn_id: &[u8]) -> ConnectionId<'static> {
+    let conn_id = ring::hmac::sign(conn_id_seed, dest_conn_id);
+    let conn_id = &conn_id.as_ref()[..quiche::MAX_CONN_ID_LEN];
+    conn_id.to_vec().into()
+}
+
 // TODO: Graceful shutdown :(
 fn launch_loop(
     mut clients: ClientMap,
@@ -97,110 +267,16 @@ fn launch_loop(
                     if let Ok(hdr) = quiche::Header::from_slice(pkt_buf, quiche::MAX_CONN_ID_LEN) {
                         trace!("got packet {:?}", hdr);
 
+                        let conn_id = get_conn_id(&conn_id_seed, &hdr.dcid);
 
-                        let conn_id = ring::hmac::sign(&conn_id_seed, &hdr.dcid);
-                        let conn_id = &conn_id.as_ref()[..quiche::MAX_CONN_ID_LEN];
-                        let conn_id = conn_id.to_vec().into();
-
-                        let (_, client) = if !clients.contains_key(&hdr.dcid) && !clients.contains_key(&conn_id) {
-                            let mut out = [0; MAX_DATAGRAM_SIZE];
-                            if hdr.ty != quiche::Type::Initial {
-                                error!("Packet is not Initial");
-                                continue;
-                            }
-
-                            if !quiche::version_is_supported(hdr.version) {
-                                warn!("Doing version negotiation");
-
-                                let len = quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut out).unwrap();
-
-                                let out = &out[..len];
-
-                                if let Err(e) = sock.send_to(out, &src).await {
-                                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                                        debug!("send() would block");
-                                        break;
-                                    }
-
-                                    panic!("send() failed: {:?}", e);
-                                }
-                                continue;
-                            }
-
-                            let mut scid = [0; quiche::MAX_CONN_ID_LEN];
-                            scid.copy_from_slice(&conn_id);
-
-                            let scid = quiche::ConnectionId::from_ref(&scid);
-
-                            // Token is always present in Initial packets.
-                            let token = hdr.token.as_ref().unwrap();
-
-                            // Do stateless retry if the client didn't send a token.
-                            if token.is_empty() {
-                                warn!("Doing stateless retry");
-
-                                let new_token = mint_token(&hdr, &src);
-
-                                let len = quiche::retry(
-                                    &hdr.scid,
-                                    &hdr.dcid,
-                                    &scid,
-                                    &new_token,
-                                    hdr.version,
-                                    &mut out,
-                                )
-                                .unwrap();
-
-                                let out = &out[..len];
-
-                                if let Err(e) = sock.send_to(out, &src).await {
-                                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                                        debug!("send() would block");
-                                        break;
-                                    }
-
-                                    panic!("send() failed: {:?}", e);
-                                }
-                                continue;
-                            }
-
-                            let odcid = validate_token(&src, token);
-
-                            // The token was not valid, meaning the retry failed, so
-                            // drop the packet.
-                            if odcid.is_none() {
-                                error!("Invalid address validation token");
-                                continue;
-                            }
-
-                            if scid.len() != hdr.dcid.len() {
-                                error!("Invalid destination connection ID");
-                                continue;
-                            }
-
-                            // Reuse the source connection ID we sent in the Retry packet,
-                            // instead of changing it again.
-                            let scid = hdr.dcid.clone();
-
-                            debug!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
-
-                            let conn = quiche::accept(&scid, odcid.as_ref(), &mut config).unwrap();
-
-                            let client = Client {
-                                conn,
-                                partial_responses: HashMap::new(),
-                            };
-
-                            clients.insert(scid.clone(), (src, client));
-
-                            clients.get_mut(&scid).unwrap()
-                        } else {
-                            match clients.get_mut(&hdr.dcid) {
-                                Some(v) => v,
-
-                                None => clients.get_mut(&conn_id).unwrap(),
-                            }
-                        };
+                        let (_, client) = skip_none!(get_client(
+                            &mut clients,
+                            &hdr,
+                            &conn_id,
+                            &src,
+                            &sock,
+                            &mut config,
+                        ).await);
 
                         // Process potentially coalesced packets.
                         let read = match client.conn.recv(pkt_buf) {
@@ -215,36 +291,14 @@ fn launch_loop(
                         debug!("{} processed {} bytes", client.conn.trace_id(), read);
 
                         if client.conn.is_in_early_data() || client.conn.is_established() {
-                            // Handle writable streams.
-                            for stream_id in client.conn.writable() {
-                                handle_writable(client, stream_id);
-                            }
-
-                            // Process all readable streams.
-                            for s in client.conn.readable() {
-                                while let Ok((read, fin)) = client.conn.stream_recv(s, &mut buf) {
-                                    debug!("{} received {} bytes", client.conn.trace_id(), read);
-
-                                    let stream_buf = &buf[..read];
-
-                                    debug!(
-                                        "{} stream {} has {} bytes (fin? {})",
-                                        client.conn.trace_id(),
-                                        s,
-                                        stream_buf.len(),
-                                        fin
-                                    );
-
-                                    handle_stream(client, s, stream_buf, "index.html").await;
-                                }
-                            }
+                            handle_ready_client(client).await;
                         }
                     } else {
                         error!("Got malformed pkg");
                     }
                 }
                 Ok(_) = &mut rx_notify_close => {
-                    trace!("Closing connection");
+                    trace!("Closing Server");
                     close = true;
                 }
             };

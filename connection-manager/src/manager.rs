@@ -1,5 +1,6 @@
 use crate::config::*;
 use anyhow::Result;
+use futures::future::OptionFuture;
 use log::{debug, error, info};
 use quiche::Connection;
 use std::net::ToSocketAddrs;
@@ -146,6 +147,8 @@ fn process_streams(conn: &mut Pin<Box<Connection>>, mut buf: &mut [u8]) {
             print!("{}", unsafe { std::str::from_utf8_unchecked(&stream_buf) });
 
             /*
+             * TODO: Connection should be closed if we are done sending(Current architecture makes
+             * this hard)
             if s == HTTP_REQ_STREAM_ID && fin {
                 debug!("closing connection...");
 
@@ -179,21 +182,10 @@ fn launch_loop(
     let mut tx_notify_close = Some(tx_notify_close);
     let mut ready = true;
     tokio::spawn(async move {
-        let mut buf = [0; 65535];
+        let mut buf = [0; MAX_DATAGRAM_SIZE];
         let mut queued_messages = Some(Vec::new());
-        let mut write_result = Ok(());
         loop {
-            let timeout = match conn.timeout() {
-                Some(t) => t,
-                None => {
-                    debug!("Timer disarmed");
-                    notify_close(write_result, &mut tx_notify_close);
-
-                    break;
-                }
-            };
-
-            let sleep = tokio::time::sleep(timeout);
+            let sleep: OptionFuture<_> = conn.timeout().map(|t| tokio::time::sleep(t)).into();
             tokio::pin!(sleep);
             tokio::select! {
                 _ = &mut sleep => {
@@ -222,7 +214,6 @@ fn launch_loop(
                     }
 
                 }
-                // TODO: Stop using channels, and move this to a method
                 Some(what) = rx.recv(), if ready => {
                     let mut what = what;
                     if conn.is_established() {
@@ -233,9 +224,11 @@ fn launch_loop(
                         what.drain(..sent_len);
                         ready = false;
                         let tx = tx.clone();
-                        tokio::spawn(async move {
-                            tx.send(what).await.expect("Reciever dropped while sending message");
-                        });
+                        if what.len() > 0 {
+                            tokio::spawn(async move {
+                                tx.send(what).await.expect("Reciever dropped while sending message");
+                            });
+                        }
 
                         info!("Will send {:?} bytes", sent_len);
                     } else {
@@ -244,10 +237,9 @@ fn launch_loop(
                 }
             };
 
-            let was_closed = conn.is_closed();
-            write_result = write_loop(&mut conn, &sock).await;
+            let write_result = write_loop(&mut conn, &sock).await;
             // Should extract the repeated logic for checking connection is closed
-            if !was_closed && conn.is_closed() {
+            if conn.is_closed() {
                 debug!("connection closed");
                 notify_close(write_result, &mut tx_notify_close);
                 break;
