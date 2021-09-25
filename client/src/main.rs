@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::prelude::*;
 
 use connection_manager::ConnectionManager;
+const HTTP_REQ_STREAM_ID: u64 = 4;
 
 #[tokio::main]
 async fn main() -> tokio::io::Result<()> {
@@ -33,7 +34,7 @@ async fn main() -> tokio::io::Result<()> {
     f.read_to_end(&mut file_buf)?;
 
     connection_manager
-        .send(file_buf.clone())
+        .send(file_buf.clone(), HTTP_REQ_STREAM_ID)
         .await
         .expect("Couldn't send file");
 

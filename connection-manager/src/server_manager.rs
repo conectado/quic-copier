@@ -9,7 +9,6 @@ use std::pin::Pin;
 use thiserror::Error;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
-use tokio::net::ToSocketAddrs;
 use tokio::{net::UdpSocket, sync::oneshot};
 
 use ring::hmac::Key;
@@ -169,7 +168,7 @@ async fn get_client<'a>(
 
         debug!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
 
-        let conn = quiche::accept(&scid, odcid.as_ref(), &mut config).unwrap();
+        let conn = quiche::accept(&scid, odcid.as_ref(), *src, &mut config).unwrap();
 
         let client = Client {
             conn,
@@ -240,12 +239,12 @@ fn launch_loop(
     conn_id_seed: Key,
     mut config: Config,
     sock: UdpSocket,
-    rx_notify_close: oneshot::Receiver<()>,
+    mut rx_notify_close: oneshot::Receiver<()>,
 ) {
     tokio::spawn(async move {
         let mut buf = [0; MAX_DATAGRAM_SIZE];
         let mut close = false;
-        tokio::pin!(rx_notify_close);
+        //tokio::pin!(rx_notify_close);
         while !close {
             let sleep: OptionFuture<_> = clients
                 .values()
@@ -260,8 +259,8 @@ fn launch_loop(
                 _ = &mut sleep  => {
                     clients.values_mut().for_each(|(_, c)| c.conn.on_timeout());
                 }
-                Ok((len, src)) = sock.recv_from(&mut buf) => {
-                    debug!("got {} bytes from {}", len, src);
+                Ok((len, from)) = sock.recv_from(&mut buf) => {
+                    debug!("got {} bytes from {}", len, from);
                     let pkt_buf = &mut buf[..len];
 
                     if let Ok(hdr) = quiche::Header::from_slice(pkt_buf, quiche::MAX_CONN_ID_LEN) {
@@ -273,13 +272,14 @@ fn launch_loop(
                             &mut clients,
                             &hdr,
                             &conn_id,
-                            &src,
+                            &from,
                             &sock,
                             &mut config,
                         ).await);
 
                         // Process potentially coalesced packets.
-                        let read = match client.conn.recv(pkt_buf) {
+                        let recv_info = quiche::RecvInfo {from};
+                        let read = match client.conn.recv(pkt_buf, recv_info) {
                             Ok(v) => v,
 
                             Err(e) => {
@@ -310,24 +310,20 @@ fn launch_loop(
 }
 
 async fn write_all_clients_loop(clients: &mut ClientMap, socket: &UdpSocket) {
-    for (peer, client) in clients.values_mut() {
-        if let Some(err) = write_loop(&mut client.conn, socket, peer).await.err() {
-            error!("Error {} while writing to {}", err, peer);
+    for (_, client) in clients.values_mut() {
+        if let Some(err) = write_loop(&mut client.conn, socket).await.err() {
+            error!("Error {} while writing", err);
         }
     }
 }
 
-async fn write_loop(
-    conn: &mut Pin<Box<Connection>>,
-    socket: &UdpSocket,
-    to: &impl ToSocketAddrs,
-) -> tokio::io::Result<()> {
+async fn write_loop(conn: &mut Pin<Box<Connection>>, socket: &UdpSocket) -> tokio::io::Result<()> {
     let mut out = [0; MAX_DATAGRAM_SIZE];
 
     loop {
         // Generate outgoing QUIC packets and send them on the UDP socket, until
         // quiche reports that there are no more packets to be sent.
-        let write = match conn.send(&mut out) {
+        let (write, info) = match conn.send(&mut out) {
             Ok(v) => v,
 
             Err(quiche::Error::Done) => {
@@ -346,7 +342,7 @@ async fn write_loop(
             }
         };
 
-        let sent_len = socket.send_to(&out[..write], to).await?;
+        let sent_len = socket.send_to(&out[..write], info.to).await?;
         debug!("written {}", sent_len);
     }
 }
