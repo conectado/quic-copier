@@ -25,6 +25,7 @@ fn hex_dump(buf: &[u8]) -> String {
 pub struct ConnectionManager {
     tx: mpsc::Sender<(Vec<u8>, u64)>,
     txs: Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>,
+    rx_notify_close: oneshot::Receiver<()>,
 }
 
 #[derive(Error, Debug)]
@@ -77,15 +78,22 @@ impl ConnectionManager {
 
         let (tx, rx) = mpsc::channel(32);
 
+        let (tx_notify_close, rx_notify_close) = oneshot::channel();
+
         let connection_manager = Arc::new(ConnectionManager {
             tx: tx.clone(),
+            rx_notify_close,
             txs: Default::default(),
         });
 
-        connection_manager.clone().launch_loop(socket, conn, rx, tx);
+        connection_manager
+            .clone()
+            .launch_loop(socket, conn, rx, tx, tx_notify_close);
 
         Ok(connection_manager)
     }
+
+    pub async fn close(self) {}
 
     pub async fn send(&self, what: Vec<u8>, stream_id: u64) -> anyhow::Result<Vec<u8>> {
         let (tx, rx) = oneshot::channel();
@@ -193,6 +201,7 @@ impl ConnectionManager {
         mut conn: Pin<Box<Connection>>,
         mut rx: mpsc::Receiver<(Vec<u8>, u64)>,
         tx: mpsc::Sender<(Vec<u8>, u64)>,
+        tx_notify_close: oneshot::Sender<()>,
     ) {
         tokio::spawn(async move {
             let mut buf = [0; MAX_DATAGRAM_SIZE];
@@ -207,7 +216,7 @@ impl ConnectionManager {
                         conn.on_timeout();
                     }
                     Ok((len, from)) = sock.recv_from(&mut buf) => {
-                        debug!("got {} bytes", len);
+                        debug!("got {} bytes from {}", len, from);
                         let was_established = conn.is_established();
                         // Process potentially coalesced packets.
                         let recv_info = quiche::RecvInfo {from};
@@ -266,6 +275,9 @@ impl ConnectionManager {
                 // Should extract the repeated logic for checking connection is closed
                 if conn.is_closed() {
                     debug!("connection closed");
+                    if let Err(_) = tx_notify_close.send(()) {
+                        error!("No one waiting for close");
+                    }
                     break;
                 }
             }

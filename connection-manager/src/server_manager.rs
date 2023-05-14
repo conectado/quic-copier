@@ -249,7 +249,6 @@ fn launch_loop(
             let sleep: OptionFuture<_> = clients
                 .values()
                 .filter_map(|(_, c)| c.conn.timeout())
-                // Appeasing the borrow checker god
                 .min()
                 .map(|t| tokio::time::sleep(t))
                 .into();
